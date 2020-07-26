@@ -6,20 +6,33 @@
  * 
  * Additions by BöserFisch for hacked DPF access
  *
+ * Additions by irimi_at_gmx_de for direct Python RGB Image access
+ *
  */
 
-#include "Python.h"
+#include <Python.h>
 #include "dpf.h"
 
 #ifdef DEBUG
 #	include <stdio.h>
 #endif
 
+#define _RGB565_0(p) \
+	(( ((p->R) & 0xf8)      ) | (((p->G) & 0xe0) >> 5))
+#define _RGB565_1(p) \
+	(( ((p->G) & 0x1c) << 3 ) | (((p->B) & 0xf8) >> 3))
+
 #define CONCAT(x, y)   x##y
 #define INITMODULE(x)  CONCAT(init, x)
 #define RESOLVE(x)     #x
 #define STRINGIFY(x)   RESOLVE(x)
 
+typedef struct {
+    unsigned char R;
+    unsigned char G;
+    unsigned char B;
+    unsigned char A;
+} RGBA;
 ////////////////////////////////////////////////////////////////////////////
 // AUX
 
@@ -38,13 +51,13 @@ handleError(int err, int line)
 			sprintf(s, "%d:%s", line, dev_errstr(err));
 			break;
 		default:
-			sprintf(s, "%d:(%x): %s", line, err, dev_errstr(err));
+			sprintf(s, "Line %d: %s (code %x)", line, dev_errstr(err), err);
 	}
 	PyErr_SetString(exctype, s);
 	return NULL;
 }
 
-staticforward PyTypeObject DeviceType;
+static PyTypeObject DeviceType;
 
 ////////////////////////////////////////////////////////////////////////////
 //
@@ -60,7 +73,7 @@ typedef struct {
 	uint16_t        flags;
 } DeviceObject;
 
-staticforward PyTypeObject DeviceType;
+static PyTypeObject DeviceType;
 
 #define DeviceObject_Check(v)	((v)->ob_type == &DeviceType)
 
@@ -109,7 +122,7 @@ Device_readflash(DeviceObject *self, PyObject *args)
 	if (!PyArg_ParseTuple(args, "II", &addr, &count))
 		return NULL;
 
-	p = PyBuffer_New(count);
+	p =  malloc(count);
 
 	error = PyObject_AsWriteBuffer(p, (void**) &buf, &sz);
 	while (error >= 0 && count > MAX_CHUNKSIZE) {
@@ -212,9 +225,12 @@ Device_setProperty(DeviceObject *self, PyObject *args)
 	if (!PyArg_ParseTuple(args, "iO", &prop, &p))
 		return NULL;
 
-	if (PyInt_Check(p)) {
+	if (PyLong_Check(p)) {
 		v.type = TYPE_INTEGER;
-		v.value.integer = PyInt_AsLong(p);
+		v.value.integer = PyLong_AsLong(p);
+	}
+	else{
+		return NULL;
 	}
 
 	error = dpf_setproperty(self->dpf, prop, &v);
@@ -265,7 +281,7 @@ Device_readmem(DeviceObject *self, PyObject *args)
 	if (!PyArg_ParseTuple(args, "Ii", &addr, &count))
 		return NULL;
 
-	p = PyBuffer_New(count);
+	p =  malloc(count);
 
 	error = PyObject_AsWriteBuffer(p, (void**) &buf, &sz);
 	if (error >= 0) {
@@ -333,6 +349,68 @@ Device_runapp(DeviceObject *self, PyObject *args)
 	return Py_None;
 
 }
+
+PyObject *
+Device_showRGBAImage(DeviceObject *self, PyObject *args)
+{
+
+	int error;
+	Py_buffer pybuf;
+	int width;
+	int height;
+	int row;
+	int col;
+    int index;
+    short rect[4];
+    RGBA *p;
+    unsigned char *pix;
+    unsigned char *fb_565=NULL;
+	PyObject *po;
+
+	if (!PyArg_ParseTuple(args, "IIIIO", &col, &row, &width,&height, &po)){
+		PyErr_SetString(PyExc_TypeError, "ParseTuple showRGBAImage");
+		return Py_None;
+	}
+	rect[0] = col; rect[1] = row;
+	rect[2] = col + width; rect[3] = row + height;
+
+	if (PyObject_CheckBuffer(po)){
+		error = PyObject_GetBuffer(po, &pybuf, PyBUF_SIMPLE);
+		if (error < 0) return HANDLE_ERROR(error, "read buffer");
+	}
+	else{
+		PyErr_SetString(PyExc_TypeError, "Wrong gfx data buffer type");
+		return Py_None;
+	}
+
+	if (pybuf.len != height * width * 4){
+		PyErr_SetString(PyExc_TypeError, "Wrong gfx data buffer size");
+		return Py_None;
+	}
+
+	fb_565 = malloc(height * width * 2);
+    p = (RGBA *)(pybuf.buf);
+	pix = fb_565;
+    for (index = 0; index < pybuf.len-4; index+=4) {
+	    *pix++ = _RGB565_0(p);
+	    *pix++ = _RGB565_1(p);
+	    p++;
+	}
+	dpf_screen_blit(self->dpf, fb_565, rect);
+
+	if (fb_565) free(fb_565);
+    PyBuffer_Release(&pybuf); // !?
+
+    Py_INCREF(Py_None);
+    return Py_None;
+}
+
+PyObject *
+Device_getRes(DeviceObject *self)
+{
+	return Py_BuildValue("(ii)",(self->dpf)->width, (self->dpf)->height);
+}
+
 static PyMethodDef Device_methods[] = 
 {
 	// BASIC ACCESS
@@ -348,13 +426,20 @@ static PyMethodDef Device_methods[] =
 	{"loadApp",      (PyCFunction) Device_loadapp,         METH_VARARGS},
 	{"run",          (PyCFunction) Device_exec,            METH_VARARGS},
 	{"runApp",       (PyCFunction) Device_runapp,          METH_VARARGS},
-	{NULL,		NULL}		/* sentinel */
+	{"getRes",       (PyCFunction) Device_getRes,          METH_NOARGS},
+	{"showRGBAImage", (PyCFunction) Device_showRGBAImage,  METH_VARARGS},
+	{NULL, NULL}		/* sentinel */
 };
 
 ////////////////////////////////////////////////////////////////////////////
 // Device type object standard methods
 //
 
+static PyObject *
+Device_getattr(DeviceObject *self, char *name)
+{
+	return PyObject_GenericGetAttr((PyObject *)self, PyUnicode_FromString(name));
+}
 
 static void
 Device_dealloc(DeviceObject *self)
@@ -365,59 +450,53 @@ Device_dealloc(DeviceObject *self)
 }
 
 
-static PyObject *
-Device_getattr(DeviceObject *self, char *name)
-{
-	return Py_FindMethod(Device_methods, (PyObject *)self, name);
-}
 
 // finally, the object type definition
 
-statichere PyTypeObject DeviceType = {
+static PyTypeObject DeviceType = {
 	/* The ob_type field must be initialized in the module init function
 	 * to be portable to Windows without using C++. */
-	PyObject_HEAD_INIT(NULL)
-	0,			/*ob_size*/
-	"device.Device",		/*tp_name*/
-	sizeof(DeviceObject),	/*tp_basicsize*/
-	0,			/*tp_itemsize*/
+	PyVarObject_HEAD_INIT(NULL, 0)
+	"device.Device",				/*tp_name*/
+	sizeof(DeviceObject),			/*tp_basicsize*/
+	0,								/*tp_itemsize*/
 	/* methods */
-	(destructor) Device_dealloc, /*tp_dealloc*/
-	0,			/*tp_print*/
-	(getattrfunc) Device_getattr, /*tp_getattr*/
-	(setattrfunc) 0, /*tp_setattr*/
-	0,			/*tp_compare*/
-	0,			/*tp_repr*/
-	0,			/*tp_as_number*/
-	0,			/*tp_as_sequence*/
-	0,			/*tp_as_mapping*/
-	0,			/*tp_hash*/
-        0,                      /*tp_call*/
-        0,                      /*tp_str*/
-        0,                      /*tp_getattro*/
-        0,                      /*tp_setattro*/
-        0,                      /*tp_as_buffer*/
-        Py_TPFLAGS_DEFAULT,     /*tp_flags*/
-        0,                      /*tp_doc*/
-        0,                      /*tp_traverse*/
-        0,                      /*tp_clear*/
-        0,                      /*tp_richcompare*/
-        0,                      /*tp_weaklistoffset*/
-        0,                      /*tp_iter*/
-        0,                      /*tp_iternext*/
-        0,                      /*tp_methods*/
-        0,                      /*tp_members*/
-        0,                      /*tp_getset*/
-        0,                      /*tp_base*/
-        0,                      /*tp_dict*/
-        0,                      /*tp_descr_get*/
-        0,                      /*tp_descr_set*/
-        0,                      /*tp_dictoffset*/
-        0,                      /*tp_init*/
-        0,                      /*tp_alloc*/
-        0,                      /*tp_new*/
-        0,                      /*tp_free*/
-        0,                      /*tp_is_gc*/
+	(destructor) Device_dealloc,	/*tp_dealloc*/
+	0,								/*tp_print*/
+	Device_getattr, 				/*tp_getattr*/
+	0,								/*tp_setattr*/
+	0,								/*tp_compare*/
+	0,								/*tp_repr*/
+	0,								/*tp_as_number*/
+	0,								/*tp_as_sequence*/
+	0,								/*tp_as_mapping*/
+	0,								/*tp_hash*/
+	0,								/*tp_call*/
+	0,								/*tp_str*/
+	0,								/*tp_getattro*/
+	0,								/*tp_setattro*/
+	0,								/*tp_as_buffer*/
+	Py_TPFLAGS_DEFAULT,				/*tp_flags*/
+	0,								/*tp_doc*/
+	0,								/*tp_traverse*/
+	0,								/*tp_clear*/
+	0,								/*tp_richcompare*/
+	0,								/*tp_weaklistoffset*/
+	0,								/*tp_iter*/
+	0,								/*tp_iternext*/
+	Device_methods,					/*tp_methods*/
+	0,								/*tp_members*/
+	0,								/*tp_getset*/
+	0,								/*tp_base*/
+	0,								/*tp_dict*/
+	0,								/*tp_descr_get*/
+	0,								/*tp_descr_set*/
+	0,								/*tp_dictoffset*/
+	0,								/*tp_init*/
+	0,								/*tp_alloc*/
+	0,								/*tp_new*/
+	0,								/*tp_free*/
+	0,								/*tp_is_gc*/
 };
 
 
@@ -488,14 +567,21 @@ static PyMethodDef device_methods[] = {
 	__declspec(dllexport)
 #endif
 
-void
-INITMODULE(MODULENAME)(void)
-{
-	// XXX
-	// this only for windows portability
-	// might be removed when using g++ or any other C++ compiler
-	DeviceType.ob_type = &PyType_Type;
-	//
-	Py_InitModule("dpf", device_methods);
 
+static struct PyModuleDef moduledef = {
+	PyModuleDef_HEAD_INIT,
+	"dpflib",					/* m_name */
+	"Module for dpflib",		/* m_doc */
+	-1,							/* m_size */
+	device_methods,				/* m_methods */
+	NULL,						/* m_reload */
+	NULL,						/* m_traverse */
+	NULL,						/* m_clear */
+	NULL,						/* m_free */
+};
+
+PyMODINIT_FUNC PyInit_dpflib(void)
+{
+    Py_TYPE(&DeviceType) = &PyType_Type;
+    return PyModule_Create(&moduledef);
 }

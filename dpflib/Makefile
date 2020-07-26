@@ -10,7 +10,7 @@ else
 LIBS=-lusb -lsgutils2
 endif
 
-CFLAGS = -Wall -fPIC -I../include -g
+CFLAGS = -Wall -fPIC -I../include -I=${includedir} -g
 # CFLAGS += -DDEBUG
 
 ifndef DESTDIR
